@@ -29,6 +29,7 @@ import android.provider.DocumentsContract
 import android.content.ContentResolver
 import android.content.Intent.*
 import android.database.Cursor
+import java.security.MessageDigest
 import java.util.*
 
 
@@ -41,12 +42,15 @@ private const val FLASH_DRIVE_URI =
 class MainActivity : AppCompatActivity() {
     val LOGTAG = "MainActivity"
     val REQUEST_CODE = 12123
-
+    val LENGTH = 32
+    val DEVICE_COUNT = "Device_Count"
+    private lateinit var activity: MainActivity
     private lateinit var usbManager: UsbManager
 
     private lateinit var statusView: TextView
     private lateinit var resultView: TextView
     private lateinit var permissionIntent: PendingIntent
+    private var data_to_hash = ByteArray(LENGTH)
 
     private var usbReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -62,17 +66,19 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
             }
-            val device = intent.getParcelableExtra<UsbDevice>(UsbManager.EXTRA_DEVICE)
-            device?.let {
-                printStatus(getString(R.string.status_removed))
-                printDeviceDescription(it)
-            }
         }
+    }
+
+    fun hash(): String {
+        val md = MessageDigest.getInstance("SHA-256")
+        val digest = md.digest(data_to_hash)
+        return digest.fold("", { str, it -> str + "%02x".format(it) })
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
+        activity = this
 
         statusView = findViewById(R.id.text_status)
         resultView = findViewById(R.id.text_result)
@@ -92,7 +98,6 @@ class MainActivity : AppCompatActivity() {
             if (uriString != "")
                 checkFolderExist(Uri.parse(uriString), 4999)
         }
-
         handleIntent(intent)
     }
 
@@ -107,8 +112,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun openDocumentTree() {
-        // read uriString from shared preferences
-        Log.v("_device_", "openDocumentTree")
         val pref = this.getPreferences(Context.MODE_PRIVATE)
         val uriString = pref.getString(FOLDER_URI, "") ?: ""
         when {
@@ -133,18 +136,17 @@ class MainActivity : AppCompatActivity() {
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
-        Log.v("_device_", "onActivityResult")
         if (resultCode == RESULT_OK && requestCode == REQUEST_CODE) {
-            Log.v("_device_", "ok")
             if (data != null) {
-                Log.v("_device_", "data ok")
                 //this is the uri user has provided us
                 val treeUri: Uri? = data.data
-                Log.v("_device_", "data = " + treeUri.toString())
                 if (treeUri != null) {
-                    Log.v("_device_", "treeUri ok")
                     if (Uri.decode(treeUri.toString()).endsWith(":") == false) {
-                        Log.v("_device_", "Please choose root folder!")
+                        Toast.makeText(
+                            applicationContext,
+                            "Please choose root folder!",
+                            Toast.LENGTH_SHORT
+                        ).show()
                         openDocumentTree()
                         return
                     }
@@ -152,66 +154,183 @@ class MainActivity : AppCompatActivity() {
                     val takeFlags: Int = Intent.FLAG_GRANT_READ_URI_PERMISSION or
                             Intent.FLAG_GRANT_WRITE_URI_PERMISSION
                     contentResolver.takePersistableUriPermission(treeUri, takeFlags)
-                    Log.v("_device_", "perm given")
-
-                    if (checkFolderExist(treeUri, 5000) == false) {
-                        Log.v("_device_", "Please choose root folder of the watch!")
+                    if ((checkFolderExist(treeUri, 2000) == false)) {
+                        Log.v("_device_", "ERROR! This should be unreachable")
                         releasePermissions(treeUri)
                         openDocumentTree()
                         return
                     }
-                    Log.v("_device_", "folder exist")
+                    val device_hash = hash()
 
-                    // we should store the string fo further use
                     val pref = this.getPreferences(Context.MODE_PRIVATE)
                     val editor = pref.edit()
-                    editor.putString(FOLDER_URI, treeUri.toString())
-                    editor.apply()
-
-                    copy_identification_files_to_local_storage(treeUri)
-                    Log.v("_device_", "Done")
+                    var device_count = pref.getInt(DEVICE_COUNT, -1)
+                    if (device_count == -1) { // Redundant
+                        editor.putInt(DEVICE_COUNT, 0)
+                        device_count = 0
+                        editor.apply()
+                    }
+                    val succeeded =
+                        copy_identification_files_to_local_storage(treeUri, device_count)
+                    if (succeeded) {
+                        editor.putString("Index_$device_count", device_hash)
+                        editor.putString(device_hash, treeUri.toString())
+                        editor.putInt(DEVICE_COUNT, device_count + 1)
+                        editor.apply()
+                        Toast.makeText(applicationContext, "Done!", Toast.LENGTH_SHORT).show()
+                    } else {
+                        Toast.makeText(
+                            applicationContext,
+                            "Identification files could not be found!" +
+                                    "Please choose a correct drive or " +
+                                    "please insert correct device",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                        //openDocumentTree() // uncomment this
+                    }
 
                 }
             }
         }
     }
 
-    private fun copy_identification_files_to_local_storage(treeUri: Uri) {
-        Log.v("_device_", "copy_identification_files_to_local_storage")
+    private fun copy_identification_files_to_local_storage(treeUri: Uri, index: Int): Boolean {
         var dir_watch = DocumentFile.fromTreeUri(this, treeUri)
-        var sett = dir_watch?.findFile(".settings.bin")
-        if(sett ==null) Log.v("_device_", "got problem")
-        var file_app = this.getExternalFilesDir("CopyLocation")
-        if (file_app != null) {
-            val dest = DocumentFile.fromFile(file_app)
-            val file = dest.createFile("*/txt","test.txt")
-            if (file != null && file.canWrite()) {
-                Log.v("_device_", "file.uri = ${file.uri.toString()}")
-                var inputStream = sett?.let { contentResolver.openInputStream(it.uri) }
-                var outputStream = file?.let { contentResolver.openOutputStream(it.uri) }
-                val buf = ByteArray(1024)
-                var len : Int = inputStream?.read(buf)?:0
-                Log.v("_device_", "len: $len")
-                while (len > 0) {
-                    outputStream?.write(buf, 0, len)
-                    len = inputStream?.read(buf)?:0
-                    Log.v("_device_", "len: $len")
-                }
-                outputStream?.close()
-                inputStream?.close()
-            }
+        var settings_file = dir_watch?.findFile(".settings.bin")
+        var watch_id_file = dir_watch?.findFile(".watch.id")
+        if (settings_file == null) {
+            Log.v("_device_", "copy::Settings File could not be found!")
+            return false;
         }
+        if (watch_id_file == null) {
+            Log.v("_device_", "copy::Watch ID File could not be found!")
+            return false;
+        }
+        var identificationFolder = this.getExternalFilesDir("IdentificationsFolder")
+        val docFil = identificationFolder?.let { DocumentFile.fromFile(it) }
+        // Check if they exist ?????
+        val copyied_settings_file = docFil?.createFile("*/bin", ".$index.settings.bin")
+
+        if (copyied_settings_file != null && copyied_settings_file.canWrite()) {
+            var inputStream = settings_file?.let { contentResolver.openInputStream(it.uri) }
+            var outputStream =
+                copyied_settings_file?.let { contentResolver.openOutputStream(it.uri) }
+            val buf = ByteArray(1024)
+            var len: Int = inputStream?.read(buf) ?: 0
+            while (len > 0) {
+                outputStream?.write(buf, 0, len)
+                len = inputStream?.read(buf) ?: 0
+            }
+            outputStream?.close()
+            inputStream?.close()
+        } else {
+            return false
+        }
+        val copyied_watch_id_file = docFil?.createFile("*/id", ".$index.watch.id")
+        if (copyied_watch_id_file != null && copyied_watch_id_file.canWrite()) {
+            var inputStream = watch_id_file?.let { contentResolver.openInputStream(it.uri) }
+            var outputStream =
+                copyied_watch_id_file?.let { contentResolver.openOutputStream(it.uri) }
+            val buf = ByteArray(1024)
+            var len: Int = inputStream?.read(buf) ?: 0
+            while (len > 0) {
+                outputStream?.write(buf, 0, len)
+                len = inputStream?.read(buf) ?: 0
+            }
+            outputStream?.close()
+            inputStream?.close()
+        } else {
+            return false
+        }
+        return true
+    }
+
+    private fun compare_identification_files_to_local_storage(treeUri: Uri, index: Int): Boolean {
+        var dir_watch = DocumentFile.fromTreeUri(this, treeUri)
+        var settings_file = dir_watch?.findFile(".settings.bin")
+        var watch_id_file = dir_watch?.findFile(".watch.id")
+        if (settings_file == null) {
+            Log.v("_device_", "compare::Settings File could not be found!")
+            Log.v("_device_", "uri::$treeUri")
+            return false;
+        }
+        if (watch_id_file == null) {
+            Log.v("_device_", "compare::Watch ID File could not be found!")
+            Log.v("_device_", "uri::$treeUri")
+            return false;
+        }
+        var identificationFolder = this.getExternalFilesDir("IdentificationsFolder")
+        val docFil = identificationFolder?.let { DocumentFile.fromFile(it) }
+        // Check if they exist ?????
+        val saved_settings_file = docFil?.findFile(".$index.settings.bin")
+
+        if (saved_settings_file != null && saved_settings_file.canWrite()) {
+            var i_w = settings_file?.let { contentResolver.openInputStream(it.uri) }
+            var i_s = saved_settings_file?.let { contentResolver.openInputStream(it.uri) }
+            val buf_w = ByteArray(1024)
+            val buf_s = ByteArray(1024)
+            var len_w: Int = i_w?.read(buf_w) ?: 0
+            var len_s: Int = i_s?.read(buf_s) ?: 0
+            while (len_w > 0 || len_s > 0) {
+                if (len_s != len_w) {
+                    i_w?.close()
+                    i_s?.close()
+                    return false
+                }
+                for (i in 0 until len_w) {
+                    if (buf_w[i] != buf_s[i]) {
+                        i_w?.close()
+                        i_s?.close()
+                        return false
+                    }
+                }
+                len_w = i_w?.read(buf_w) ?: 0
+                len_s = i_s?.read(buf_s) ?: 0
+            }
+            i_w?.close()
+            i_s?.close()
+        } else {
+            return false
+        }
+        val saved_watch_id_file = docFil?.findFile(".$index.watch.id")
+        if (saved_watch_id_file != null && saved_watch_id_file.canWrite()) {
+            var i_w = watch_id_file?.let { contentResolver.openInputStream(it.uri) }
+            var i_s = saved_watch_id_file?.let { contentResolver.openInputStream(it.uri) }
+            val buf_w = ByteArray(1024)
+            val buf_s = ByteArray(1024)
+            var len_w: Int = i_w?.read(buf_w) ?: 0
+            var len_s: Int = i_s?.read(buf_s) ?: 0
+            while (len_w > 0 || len_s > 0) {
+                if (len_s != len_w) {
+                    i_w?.close()
+                    i_s?.close()
+                    return false
+                }
+                for (i in 0 until len_w) {
+                    if (buf_w[i] != buf_s[i]) {
+                        i_w?.close()
+                        i_s?.close()
+                        return false
+                    }
+                }
+                len_w = i_w?.read(buf_w) ?: 0
+                len_s = i_s?.read(buf_s) ?: 0
+            }
+            i_w?.close()
+            i_s?.close()
+        } else {
+            return false
+        }
+        return true
     }
 
     private fun checkFolderExist(dirUri: Uri, timeout: Long): Boolean {
-
         val date_start = Date().time
         var dir = DocumentFile.fromTreeUri(this, dirUri)
         var time_left = Date().time - date_start
         while ((time_left < timeout) && (dir == null || !dir.exists())) {
             dir = DocumentFile.fromTreeUri(this, dirUri)
             time_left = Date().time - date_start
-            Log.v("_device_", "$time_left - $dirUri")
         }
         if (Date().time - date_start > timeout) {
             Toast.makeText(applicationContext, "Timeout has accured", Toast.LENGTH_SHORT).show()
@@ -219,37 +338,6 @@ class MainActivity : AppCompatActivity() {
             return false
         }
         return true
-        //dir.listFiles().forEach { Log.v("_device_", "" + it.name) }
-    }
-
-    private fun makeDoc(dirUri: Uri) {
-        // content://com.android.externalstorage.documents/tree/612D-B6E0%3A
-        val dir = DocumentFile.fromTreeUri(this, dirUri)
-        dirUri.path?.let { Log.v("_device_", it) }
-        if (dir == null || !dir.exists()) {
-            //the folder was probably deleted
-            Log.v("_device_", "no Dir")
-            //according to Commonsware blog, the number of persisted uri permissions is limited
-            //so we should release those we cannot use anymore
-            //https://commonsware.com/blog/2020/06/13/count-your-saf-uri-permission-grants.html
-            releasePermissions(dirUri)
-            //ask user to choose another folder
-            Toast.makeText(this, "Folder deleted, please choose another!", Toast.LENGTH_SHORT)
-                .show()
-            openDocumentTree()
-        } else {
-            val file = dir.createFile("*/txt", "test.txt")
-
-            if (file != null && file.canWrite()) {
-                Log.v("_device_", "file.uri = ${file.uri.toString()}")
-                alterDocument(file.uri)
-            } else {
-                Log.v("_device_", "no file or cannot write")
-                //consider showing some more appropriate error message
-                Toast.makeText(this, "Write error!", Toast.LENGTH_SHORT).show()
-
-            }
-        }
     }
 
     private fun releasePermissions(uri: Uri) {
@@ -261,24 +349,6 @@ class MainActivity : AppCompatActivity() {
         val editor = pref.edit()
         editor.putString(FOLDER_URI, "")
         editor.apply()
-    }
-
-    private fun alterDocument(uri: Uri) {
-        try {
-            contentResolver.openFileDescriptor(uri, "w")?.use { parcelFileDescriptor ->
-                FileOutputStream(parcelFileDescriptor.fileDescriptor).use {
-                    it.write(
-                        ("String written at ${System.currentTimeMillis()}\n")
-                            .toByteArray()
-                    )
-                    Toast.makeText(this, "File Write OK!", Toast.LENGTH_SHORT).show()
-                }
-            }
-        } catch (e: FileNotFoundException) {
-            e.printStackTrace()
-        } catch (e: IOException) {
-            e.printStackTrace()
-        }
     }
 
     private fun arePermissionsGranted(uriString: String): Boolean {
@@ -301,52 +371,72 @@ class MainActivity : AppCompatActivity() {
         val device = intent.getParcelableExtra<UsbDevice>(UsbManager.EXTRA_DEVICE)
         if (device != null) {
             usbManager.requestPermission(device, permissionIntent)
-            printStatus(getString(R.string.status_added))
-            printDeviceDetails(device)
-            openDocumentTree()
-        } else {
-            // List all devices connected to USB host on startup
-            printStatus(getString(R.string.status_list))
-            printDeviceList()
-        }
-    }
-
-    private fun printDeviceList() {
-        val connectedDevices = usbManager.deviceList
-
-        if (connectedDevices.isEmpty()) {
-            printResult("No Devices Currently Connected")
-        } else {
-            val builder = buildString {
-                append("Connected Device Count: ")
-                append(connectedDevices.size)
-                append("\n\n")
-                for (device in connectedDevices.values) {
-                    //Use the last device detected (if multiple) to open
-                    append(device.getDescription())
-                    append("\n\n")
-                }
+            var succeeded = readDeviceDetails(device)
+            if (!succeeded) {
+                Toast.makeText(
+                    applicationContext,
+                    "Could not read device details",
+                    Toast.LENGTH_SHORT
+                ).show()
+                return
             }
 
-            printResult(builder)
+            val pref = this.getPreferences(Context.MODE_PRIVATE)
+            val editor = pref.edit()
+            var device_count = pref.getInt(DEVICE_COUNT, -1)
+            if (device_count == -1) {
+                editor.putInt(DEVICE_COUNT, 0)
+                device_count = 0
+                editor.apply()
+            }
+            if (device_count == 0) {
+                openDocumentTree()
+            } else {
+                val device_hash = hash()
+                for (index in 0 until device_count) {
+                    val saved_hash = pref.getString("Index_$index", "")
+                    if (saved_hash == "") continue
+                    if (saved_hash == device_hash) {
+                        var confirmed = confirm_the_device(device_hash, index)
+                        if (confirmed) {
+                            Toast.makeText(applicationContext, "Confirmed", Toast.LENGTH_SHORT)
+                                .show()
+                            Log.v("_device_", "Confirmed")
+                            return
+                        }
+                    }
+                }
+                openDocumentTree()
+            }
         }
     }
 
-    private fun printDeviceDescription(device: UsbDevice) {
-        val result = device.getDescription() + "\n\n"
-        printResult(result)
+    private fun confirm_the_device(device_hash: String, index: Int): Boolean {
+        val pref = this.getPreferences(Context.MODE_PRIVATE)
+        val folder_uri_string = pref.getString(device_hash, "")
+        if (folder_uri_string == "") return false
+        val folder_uri = Uri.parse(folder_uri_string)
+        if (checkFolderExist(folder_uri, 10 * 1000)) {
+            if (compare_identification_files_to_local_storage(folder_uri, index)) {
+                Toast.makeText(applicationContext, "Watch is recognized", Toast.LENGTH_SHORT).show()
+                return true
+            }
+            return false
+        } else {
+            return false
+        }
     }
 
-    private fun printDeviceDetails(device: UsbDevice) {
-        return
+    private fun readDeviceDetails(device: UsbDevice): Boolean {
         val connection = usbManager.openDevice(device)
-
-        val deviceDescriptor = try {
+        var succeeded = true
+        data_to_hash = try {
             //Parse the raw device descriptor
             connection.readDeviceDescriptor()
         } catch (e: IllegalArgumentException) {
             Log.v("_device_", "Invalid device descriptor", e)
-            null
+            succeeded = false
+            ByteArray(32)
         }
 
         val configDescriptor = try {
@@ -354,21 +444,16 @@ class MainActivity : AppCompatActivity() {
             connection.readConfigurationDescriptor()
         } catch (e: IllegalArgumentException) {
             Log.v("_device_", "Invalid config descriptor", e)
+            succeeded = false
             null
         } catch (e: ParseException) {
             Log.v("_device_", "Unable to parse config descriptor", e)
+            succeeded = false
             null
         }
 
-        printResult("$deviceDescriptor\n\n$configDescriptor")
         connection.close()
+        return succeeded
     }
 
-    private fun printStatus(status: String) {
-        statusView.text = status
-    }
-
-    private fun printResult(result: String) {
-        resultView.text = result
-    }
 }

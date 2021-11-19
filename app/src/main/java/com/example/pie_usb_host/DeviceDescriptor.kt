@@ -37,7 +37,7 @@ data class DeviceDescriptor(
 /**
  * Request the device descriptor through the USB device connection.
  */
-fun UsbDeviceConnection.readDeviceDescriptor(): DeviceDescriptor {
+fun UsbDeviceConnection.readDeviceDescriptor(): ByteArray {
     val buffer = ByteArray(LENGTH)
 
     controlTransfer(
@@ -45,7 +45,7 @@ fun UsbDeviceConnection.readDeviceDescriptor(): DeviceDescriptor {
         buffer, LENGTH, TIMEOUT
     )
 
-    return parseResponse(buffer)
+    return buffer
 }
 
 // Type: Indicates whether this is a read or write
